@@ -1,5 +1,5 @@
 // Draws the app icon: the Lucide clock (Resources/icon-src/clock.svg) in white
-// on a terracotta squircle.
+// on an orange (#E96C47) squircle.
 // Usage: icongen <clock.svg> <output.png>   (1024x1024)
 import AppKit
 
@@ -21,18 +21,8 @@ let squircle = CGPath(roundedRect: body, cornerWidth: 185, cornerHeight: 185, tr
 ctx.saveGState()
 ctx.setShadow(offset: CGSize(width: 0, height: -10), blur: 28, color: CGColor(gray: 0, alpha: 0.25))
 ctx.addPath(squircle)
-ctx.setFillColor(CGColor(srgbRed: 0.851, green: 0.467, blue: 0.341, alpha: 1))   // terracotta #D97757
+ctx.setFillColor(CGColor(srgbRed: 0.914, green: 0.424, blue: 0.278, alpha: 1))   // #E96C47
 ctx.fillPath()
-ctx.restoreGState()
-
-ctx.saveGState()
-ctx.addPath(squircle)
-ctx.clip()
-let gradient = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!, colors: [
-    CGColor(srgbRed: 0.89, green: 0.52, blue: 0.39, alpha: 1),   // top
-    CGColor(srgbRed: 0.78, green: 0.39, blue: 0.27, alpha: 1),   // bottom
-] as CFArray, locations: [0, 1])!
-ctx.drawLinearGradient(gradient, start: CGPoint(x: 512, y: 924), end: CGPoint(x: 512, y: 100), options: [])
 ctx.restoreGState()
 
 let clockRect = CGRect(x: 512 - 290, y: 512 - 290, width: 580, height: 580)
