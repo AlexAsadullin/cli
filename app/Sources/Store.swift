@@ -1,4 +1,4 @@
-import Foundation
+import AppKit
 
 struct SessionInfo: Identifiable, Hashable {
     let id: String          // session UUID
@@ -211,16 +211,18 @@ final class Store: ObservableObject {
             .map { String($0.split(separator: " ")[0]) }
     }
 
-    /// Live screen (with scrollback) of the task's Claude session, else the snapshot taken after sending.
-    func claudeScreen(for task: ScheduledTask) -> (text: String, live: Bool) {
-        if let target = tmuxTarget(for: task),
-           let screen = Self.tmux(["capture-pane", "-p", "-J", "-S", "-2000", "-t", target]) {
-            return (screen, true)
-        }
-        if let snap = try? String(contentsOf: taskDir(task.id).appendingPathComponent("pane.log"), encoding: .utf8) {
-            return (snap, false)
-        }
-        return ("No Claude session to show yet.", false)
+    /// Opens a Terminal window attached to the tmux session, via a .command file
+    /// (needs no Automation permission, unlike scripting Terminal).
+    func openTerminal(attachedTo target: String) {
+        let session = target.split(separator: ":").first.map(String.init) ?? target
+        let url = supportDir.appendingPathComponent("attach-\(session).command")
+        let tmuxPath = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "tmux"
+        let script = "#!/bin/zsh\nexec \(tmuxPath) attach -t '\(session)'\n"
+        try? script.write(to: url, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        NSWorkspace.shared.open([url], withApplicationAt: URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"),
+                                configuration: NSWorkspace.OpenConfiguration())
     }
 
     /// The session's transcript file. For a new session: the first one started in the folder after the task fired.

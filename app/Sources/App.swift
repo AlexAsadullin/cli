@@ -31,7 +31,7 @@ struct LogsView: View {
     let taskId: String
     @State private var tab = "conversation"
     @State private var text = ""
-    @State private var live = false
+    @State private var follow = true
     @State private var lastModified: Date?
     private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
 
@@ -42,21 +42,21 @@ struct LogsView: View {
             HStack(spacing: 10) {
                 Picker("", selection: $tab) {
                     Text("Conversation").tag("conversation")
-                    Text("Claude screen").tag("screen")
                     Text("Run log").tag("run")
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
-                .frame(width: 320)
-                if tab == "screen" {
-                    Text(live ? "● live" : "snapshot")
-                        .font(.system(size: 11))
-                        .foregroundStyle(live ? .green : .secondary)
-                }
+                .frame(width: 220)
+                Toggle("Follow", isOn: $follow)
+                    .toggleStyle(.checkbox)
+                    .font(.system(size: 11))
+                    .help("Keep scrolled to the newest lines")
                 Spacer()
                 if let task, let target = store.tmuxTarget(for: task) {
-                    Button("Open in Terminal") { attachInTerminal(target) }
-                        .help("tmux attach -t \(target)")
+                    Button { store.openTerminal(attachedTo: target) } label: {
+                        Label("Watch live in Terminal", systemImage: "terminal")
+                    }
+                    .help("Opens Terminal attached to tmux session \(target)")
                 }
                 if let task {
                     Button { NSWorkspace.shared.open(store.taskFolder(for: task)) } label: {
@@ -68,16 +68,18 @@ struct LogsView: View {
             .padding(10)
             Divider()
             ScrollViewReader { proxy in
-                ScrollView([.vertical, .horizontal]) {
+                ScrollView(.vertical) {
                     Text(text)
                         .font(.system(size: 11, design: .monospaced))
                         .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)
                     Color.clear.frame(height: 1).id("bottom")
                 }
-                .onChange(of: text) { _, _ in proxy.scrollTo("bottom", anchor: .bottom) }
-                .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
+                .onChange(of: text) { _, _ in if follow { proxy.scrollTo("bottom", anchor: .bottomLeading) } }
+                .onChange(of: follow) { _, on in if on { proxy.scrollTo("bottom", anchor: .bottomLeading) } }
+                .onAppear { proxy.scrollTo("bottom", anchor: .bottomLeading) }
             }
         }
         .navigationTitle(task.map { "Logs — " + $0.prompt.replacingOccurrences(of: "\n", with: " ").prefix(50) } ?? "Logs")
@@ -101,23 +103,10 @@ struct LogsView: View {
                 let conversation = Store.conversation(from: url)
                 await MainActor.run { if tab == "conversation" { text = conversation } }
             }
-        } else if tab == "screen" {
-            let screen = store.claudeScreen(for: task)
-            // Drop the trailing blank lines of the tmux pane.
-            let trimmed = screen.text.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
-            if trimmed != text { text = trimmed }
-            live = screen.live
         } else {
             let log = store.runLog(for: task)
             if log != text { text = log }
         }
-    }
-
-    private func attachInTerminal(_ target: String) {
-        let session = target.split(separator: ":").first.map(String.init) ?? target
-        let script = "tell application \"Terminal\" to do script \"/opt/homebrew/bin/tmux attach -t \(session)\"\n"
-            + "tell application \"Terminal\" to activate"
-        NSAppleScript(source: script)?.executeAndReturnError(nil)
     }
 }
 

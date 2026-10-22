@@ -63,6 +63,18 @@ else
 fi
 print -r -- "$TARGET" > "$TASK_DIR/target"
 
+# Show the session in a Terminal window, so what Claude does can be watched live.
+TMUX_SESSION="${TARGET%%:*}"
+print -r -- "#!/bin/zsh
+exec $(command -v tmux) attach -t '$TMUX_SESSION'" > "$TASK_DIR/attach.command"
+chmod +x "$TASK_DIR/attach.command"
+if open -a Terminal "$TASK_DIR/attach.command"; then
+  log "Opened a Terminal window attached to tmux session $TMUX_SESSION"
+  sleep 3   # let Claude redraw at the new window size before pasting
+else
+  log "Could not open Terminal (screen locked?); continuing without it"
+fi
+
 # 2. If Claude is already busy with this very prompt (e.g. it auto-resumed after a usage
 #    limit), don't send a duplicate.
 FIRST_LINE=$(head -1 "$TASK_DIR/prompt.txt" | cut -c1-60)
