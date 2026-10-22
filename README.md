@@ -118,8 +118,20 @@ even when the app is closed. At the scheduled time it resumes the session in tmu
 tmux pane already running it), waits if Claude is busy, pastes the prompt and records whether
 Claude started working or hit the usage limit.
 
+**[⬇️ Download Claude Scheduler.app](https://github.com/AlexAsadullin/cli/releases/latest/download/Claude-Scheduler.zip)**
+(Apple Silicon, macOS 14+). Unzip it and move it to Applications. The app is not notarized, so
+on first launch right-click it and choose **Open**, or run
+`xattr -dr com.apple.quarantine "/Applications/Claude Scheduler.app"`.
+
+It needs tmux and the `claude` CLI:
+
 ```bash
 brew install tmux
+```
+
+Or build it from source:
+
+```bash
 app/build.sh   # builds and installs ~/Applications/Claude Scheduler.app
 ```
 
