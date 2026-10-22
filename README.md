@@ -104,6 +104,28 @@ tsx src/claude-schedule.ts 3       # Execute prompt #3
 tsx src/claude-schedule.ts run --prompt-file ~/my-prompts.jsonl --mode sequential --ignore-approaching-limit
 ```
 
+### Start at a specific time
+```bash
+# Wait until 20:30, then send the next prompt
+tsx src/claude-schedule.ts next --mode sequential --start-at 20:30
+```
+
+## 🖥️ Desktop app (macOS)
+
+`app/` contains **Claude Scheduler**, a small SwiftUI app: pick a folder and a Claude Code session,
+type a prompt, choose a date and time, press **Add**. Each task becomes a launchd job, so it fires
+even when the app is closed. At the scheduled time it resumes the session in tmux (or reuses the
+tmux pane already running it), waits if Claude is busy, pastes the prompt and records whether
+Claude started working or hit the usage limit.
+
+```bash
+brew install tmux
+app/build.sh   # builds and installs ~/Applications/Claude Scheduler.app
+```
+
+Requires the Xcode Command Line Tools (Swift 6) and macOS 14+. Sessions run with
+`--permission-mode auto`. The icon uses the [Lucide](https://lucide.dev) clock (ISC license).
+
 ## 📋 Commands
 
 | Command | Description |

@@ -1,0 +1,309 @@
+import AppKit
+import SwiftUI
+
+let accent = Color(red: 0.851, green: 0.467, blue: 0.341)   // #D97757
+
+@main
+struct ClaudeSchedulerApp: App {
+    @StateObject private var store = Store()
+
+    var body: some Scene {
+        Window("Claude Scheduler", id: "main") {
+            ContentView()
+                .environmentObject(store)
+                .frame(minWidth: 520, minHeight: 380)
+        }
+        .defaultSize(width: 585, height: 400)   // the size of a default Terminal window
+        .windowStyle(.hiddenTitleBar)
+        .windowResizability(.contentMinSize)
+    }
+}
+
+/// The bundled Lucide clock, stroked in the accent color.
+let clockImage: NSImage = {
+    guard let url = Bundle.main.url(forResource: "clock", withExtension: "svg"),
+          let svg = try? String(contentsOf: url, encoding: .utf8),
+          let image = NSImage(data: Data(svg.replacingOccurrences(of: "currentColor", with: "#D97757").utf8))
+    else { return NSImage(systemSymbolName: "clock", accessibilityDescription: nil)! }
+    return image
+}()
+
+let chooseFolderTag = "\u{0}choose"
+
+private func folderLabel(_ path: String) -> String {
+    let name = (path as NSString).lastPathComponent
+    let parent = ((path as NSString).deletingLastPathComponent as NSString).abbreviatingWithTildeInPath
+    return "\(name) — \(parent)"
+}
+
+struct ContentView: View {
+    @EnvironmentObject var store: Store
+    @State private var folder = ""
+    @State private var sessionId = ""          // "" = new session
+    @State private var prompt = ""
+    @State private var day = Date()
+    @State private var time = Date().addingTimeInterval(120).formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits))
+    @State private var showCalendar = false
+    @State private var error: String?
+
+    /// The chosen day at the typed HH:mm, or nil if the time doesn't parse.
+    private var fireDate: Date? {
+        let parts = time.split(separator: ":").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) }
+        guard parts.count == 2, (0..<24).contains(parts[0]), (0..<60).contains(parts[1]) else { return nil }
+        return Calendar.current.date(bySettingHour: parts[0], minute: parts[1], second: 0, of: day)
+    }
+
+    private var folderSessions: [SessionInfo] { store.sessions.filter { $0.folder == folder } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            header
+            form
+            Divider()
+            taskList
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 14)
+        .ignoresSafeArea(.container, edges: .top)
+        .tint(accent)
+        .onChange(of: store.sessions) { _, _ in pickDefaults() }
+        .onChange(of: folder) { old, new in
+            if new == chooseFolderTag {
+                folder = old
+                chooseFolder()
+            } else {
+                sessionId = folderSessions.first?.id ?? ""
+            }
+        }
+    }
+
+    private var header: some View {
+        HStack(spacing: 8) {
+            Image(nsImage: clockImage).resizable().frame(width: 15, height: 15)
+            Text("Claude Scheduler").font(.system(size: 13, weight: .semibold))
+            Spacer()
+            Button { store.reloadSessions() } label: { Image(systemName: "arrow.clockwise") }
+                .buttonStyle(.borderless)
+                .help("Reload sessions")
+        }
+        .padding(.leading, 62)   // sits in the title bar, right of the traffic-light buttons
+        .frame(height: 30)
+        .padding(.top, 1)
+    }
+
+    private var form: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Picker("", selection: $folder) {
+                    ForEach(store.folders, id: \.self) { f in
+                        Text(folderLabel(f)).tag(f)
+                    }
+                    Divider()
+                    Text("Choose Folder…").tag(chooseFolderTag)
+                }
+                .labelsHidden()
+                .help(folder)
+                .frame(width: 190)
+
+                Picker("", selection: $sessionId) {
+                    ForEach(folderSessions) { s in
+                        Text("\(s.title) · \(s.modified.formatted(.relative(presentation: .named, unitsStyle: .abbreviated)))").tag(s.id)
+                    }
+                    Divider()
+                    Text("New session").tag("")
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+            }
+            .pickerStyle(.menu)
+            .tint(.primary)
+
+            ZStack(alignment: .topLeading) {
+                TextEditor(text: $prompt)
+                    .font(.system(size: 12))
+                    .scrollContentBackground(.hidden)
+                    .padding(6)
+                if prompt.isEmpty {
+                    Text("Prompt")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 6)
+                        .allowsHitTesting(false)
+                }
+            }
+            .frame(height: 64)
+            .background(RoundedRectangle(cornerRadius: 7).fill(Color.primary.opacity(0.05)))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.primary.opacity(0.1)))
+
+            HStack(spacing: 8) {
+                Button { showCalendar.toggle() } label: {
+                    Label(day.formatted(.dateTime.weekday(.abbreviated).day().month(.abbreviated)),
+                          systemImage: "calendar")
+                        .frame(minWidth: 110, alignment: .leading)
+                }
+                .popover(isPresented: $showCalendar, arrowEdge: .bottom) {
+                    DatePicker("", selection: $day, in: Calendar.current.startOfDay(for: Date())...,
+                               displayedComponents: .date)
+                        .datePickerStyle(.graphical)
+                        .labelsHidden()
+                        .padding(10)
+                        .onChange(of: day) { _, _ in showCalendar = false }
+                }
+
+                TextField("HH:mm", text: $time)
+                    .font(.system(size: 12, design: .monospaced))
+                    .multilineTextAlignment(.center)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 64)
+                    .overlay(RoundedRectangle(cornerRadius: 5)
+                        .stroke(fireDate == nil ? Color.red.opacity(0.7) : .clear))
+                    .help("Time, 24-hour, e.g. 20:30")
+                if let error {
+                    Text(error).font(.caption).foregroundStyle(.red).lineLimit(1)
+                }
+                Spacer()
+                Button(action: add) {
+                    Text("Add").frame(width: 56)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.return, modifiers: .command)
+                .disabled(folder.isEmpty || fireDate == nil
+                          || prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+    }
+
+    private var taskList: some View {
+        Group {
+            if store.tasks.isEmpty {
+                Text("No scheduled prompts")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 2) {
+                        ForEach(store.tasks) { task in
+                            TaskRow(task: task, status: store.statuses[task.id])
+                        }
+                    }
+                }
+            }
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    private func pickDefaults() {
+        if folder.isEmpty || !store.folders.contains(folder) {
+            folder = store.folders.first ?? ""
+        }
+        if !sessionId.isEmpty, !folderSessions.contains(where: { $0.id == sessionId }) {
+            sessionId = folderSessions.first?.id ?? ""
+        } else if sessionId.isEmpty {
+            sessionId = folderSessions.first?.id ?? ""
+        }
+    }
+
+    private func chooseFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        store.addCustomFolder(url.path)
+        folder = url.path
+    }
+
+    private func add() {
+        guard let fireDate else { return }
+        do {
+            let session = folderSessions.first { $0.id == sessionId }
+            try store.add(folder: folder, session: session, prompt: prompt, at: fireDate)
+            prompt = ""
+            error = nil
+        } catch {
+            self.error = error.localizedDescription
+        }
+    }
+}
+
+struct TaskRow: View {
+    @EnvironmentObject var store: Store
+    let task: ScheduledTask
+    let status: TaskStatus?
+    @State private var hovering = false
+
+    private var state: String { status?.state ?? "scheduled" }
+
+    private var color: Color {
+        switch state {
+        case "sent", "working": return .green
+        case "running": return accent
+        case "limit": return .orange
+        case "failed": return .red
+        case "cancelled": return .secondary.opacity(0.5)
+        default: return .secondary
+        }
+    }
+
+    private var stateText: String {
+        switch state {
+        case "scheduled": return "Scheduled"
+        case "running": return "Running"
+        case "sent": return "Sent"
+        case "working": return "Working"
+        case "limit": return "Usage limit"
+        case "failed": return "Failed"
+        case "cancelled": return "Cancelled"
+        default: return state
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 10) {
+            Circle().fill(color).frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(task.prompt.replacingOccurrences(of: "\n", with: " "))
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                    .strikethrough(state == "cancelled")
+                Text("\((task.folder as NSString).lastPathComponent) · \(task.sessionTitle)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(task.fireDate.formatted(.dateTime.day().month(.abbreviated).hour().minute()))
+                    .font(.system(size: 11, design: .monospaced))
+                Text(stateText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(color)
+            }
+            Button { store.remove(task) } label: {
+                Image(systemName: state == "scheduled" ? "xmark" : "trash")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .opacity(hovering ? 1 : 0)
+            .help(state == "scheduled" ? "Cancel" : "Remove from list")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(hovering ? 0.05 : 0)))
+        .onHover { hovering = $0 }
+        .help(status?.message.isEmpty == false ? status!.message : task.prompt)
+        .contextMenu {
+            if let log = store.paneLog(for: task) {
+                Button("Show Claude screen after sending") { NSWorkspace.shared.open(log) }
+            }
+            Button("Copy prompt") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(task.prompt, forType: .string)
+            }
+        }
+    }
+}
