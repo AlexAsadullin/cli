@@ -173,6 +173,7 @@ struct ContentView: View {
             Image(nsImage: clockImage).resizable().frame(width: 15, height: 15)
             Text("Claude Scheduler").font(.system(size: 13, weight: .semibold))
             Spacer()
+            LimitsBadge()
             Button { store.reloadSessions() } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless)
                 .help("Reload sessions")
@@ -320,6 +321,73 @@ struct ContentView: View {
     }
 }
 
+/// Remaining subscription limits (5-hour session and weekly), from Claude Code's status line data.
+struct LimitsBadge: View {
+    @EnvironmentObject var store: Store
+
+    var body: some View {
+        switch store.limitsTracking {
+        case .disabled:
+            Button("Show limits") { store.enableLimitsTracking() }
+                .buttonStyle(.borderless)
+                .font(.system(size: 11))
+                .help("Adds a status line to ~/.claude/settings.json that reports your usage limits")
+        case .otherStatusLine:
+            Text("Limits: n/a")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .help("~/.claude/settings.json already has a statusLine. Remove it to let the app show limits.")
+        case .enabled:
+            if let limits = store.limits, limits.fiveHour != nil || limits.sevenDay != nil {
+                HStack(spacing: 10) {
+                    if let w = limits.fiveHour { gauge("5h", w) }
+                    if let w = limits.sevenDay { gauge("Week", w) }
+                }
+                .help(details(limits))
+            } else {
+                Text("Limits: waiting…")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .help("Appears after the next Claude Code reply in a terminal session"
+                          + (store.limitsAccountEmail.map { " (account \($0))" } ?? ""))
+            }
+        }
+    }
+
+    /// Shows % *used*, like Claude Code's own status line and /usage.
+    private func gauge(_ label: String, _ w: LimitWindow) -> some View {
+        let reset = w.resetsAt < Date()   // window rolled over since the last report
+        let used = reset ? 0 : min(100, max(0, w.usedPercent))
+        let color: Color = used >= 90 ? .red : used >= 70 ? .orange : .green
+        return HStack(spacing: 4) {
+            Text(label).foregroundStyle(.secondary)
+            if used >= 100 {
+                Text("limit · \(w.resetsAt.formatted(date: .omitted, time: .shortened))")
+                    .foregroundStyle(.red)
+            } else {
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.12)).frame(width: 34, height: 4)
+                    Capsule().fill(color).frame(width: 34 * used / 100, height: 4)
+                }
+                Text("\(Int(used.rounded()))% used").monospacedDigit()
+            }
+        }
+        .font(.system(size: 11))
+    }
+
+    private func details(_ l: UsageLimits) -> String {
+        func line(_ name: String, _ w: LimitWindow?) -> String? {
+            guard let w else { return nil }
+            if w.resetsAt < Date() { return "\(name): reset at \(w.resetsAt.formatted(date: .omitted, time: .shortened))" }
+            let used = Int(min(100, max(0, w.usedPercent)).rounded())
+            return "\(name): \(used)% used, resets \(w.resetsAt.formatted(.dateTime.weekday(.abbreviated).hour().minute()))"
+        }
+        let account = store.limitsAccountEmail.map { "Terminal account: \($0)" }
+        let lines = [account, line("5-hour session", l.fiveHour), line("Weekly", l.sevenDay)].compactMap { $0 }
+        return (lines + ["Updated \(l.updated.formatted(.relative(presentation: .named)))"]).joined(separator: "\n")
+    }
+}
+
 struct TaskRow: View {
     @EnvironmentObject var store: Store
     let task: ScheduledTask
@@ -331,7 +399,7 @@ struct TaskRow: View {
 
     private var color: Color {
         switch state {
-        case "sent", "working": return .green
+        case "sent", "working", "done": return .green
         case "running": return accent
         case "limit": return .orange
         case "failed": return .red
@@ -346,6 +414,7 @@ struct TaskRow: View {
         case "running": return "Running"
         case "sent": return "Sent"
         case "working": return "Working"
+        case "done": return "Done"
         case "limit": return "Usage limit"
         case "failed": return "Failed"
         case "cancelled": return "Cancelled"
@@ -365,6 +434,12 @@ struct TaskRow: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                if ["done", "limit", "failed", "working"].contains(state), let message = status?.message, !message.isEmpty {
+                    Text(message)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 2) {

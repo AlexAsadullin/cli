@@ -17,6 +17,20 @@ struct ScheduledTask: Identifiable, Codable, Hashable {
     var cancelled = false
 }
 
+struct LimitWindow: Equatable {
+    let usedPercent: Double
+    let resetsAt: Date
+}
+
+/// Subscription usage limits as last reported by Claude Code to the status line.
+struct UsageLimits: Equatable {
+    let fiveHour: LimitWindow?
+    let sevenDay: LimitWindow?
+    let updated: Date
+}
+
+enum LimitsTracking { case enabled, disabled, otherStatusLine }
+
 struct TaskStatus {
     var state: String       // scheduled, running, sent, working, limit, failed, cancelled
     var message: String
@@ -27,6 +41,9 @@ final class Store: ObservableObject {
     @Published var sessions: [SessionInfo] = []
     @Published var tasks: [ScheduledTask] = []
     @Published var statuses: [String: TaskStatus] = [:]
+    @Published var limits: UsageLimits?
+    @Published var limitsTracking: LimitsTracking = .disabled
+    @Published var limitsAccountEmail: String?
 
     let supportDir: URL
     private var timer: Timer?
@@ -142,9 +159,79 @@ final class Store: ObservableObject {
     }
 
     private func installRunner() {
-        guard let bundled = Bundle.main.url(forResource: "run-task", withExtension: "sh") else { return }
-        try? FileManager.default.removeItem(at: runnerURL)
-        try? FileManager.default.copyItem(at: bundled, to: runnerURL)
+        for name in ["run-task", "statusline"] {
+            guard let bundled = Bundle.main.url(forResource: name, withExtension: "sh") else { continue }
+            let dest = supportDir.appendingPathComponent("\(name).sh")
+            try? FileManager.default.removeItem(at: dest)
+            try? FileManager.default.copyItem(at: bundled, to: dest)
+        }
+    }
+
+    // MARK: Usage limits
+
+    private var claudeSettingsURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
+    }
+    private var statusLineURL: URL { supportDir.appendingPathComponent("statusline.sh") }
+
+    private func readClaudeSettings() -> [String: Any] {
+        guard let data = try? Data(contentsOf: claudeSettingsURL),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [:] }
+        return obj
+    }
+
+    func refreshLimits() {
+        let command = (readClaudeSettings()["statusLine"] as? [String: Any])?["command"] as? String
+        limitsTracking = command == nil ? .disabled
+            : command!.contains("ClaudeScheduler/statusline.sh") ? .enabled : .otherStatusLine
+
+        // Only the account the terminal `claude` is logged into (~/.claude.json); the desktop app
+        // and other logins save their limits under their own account ids.
+        let account = Self.terminalAccount()
+        if account?.email != limitsAccountEmail { limitsAccountEmail = account?.email }
+        guard let uuid = account?.uuid else { if limits != nil { limits = nil }; return }
+        let file = supportDir.appendingPathComponent("limits/\(uuid).json")
+        guard let data = try? Data(contentsOf: file),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let updated = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        else { if limits != nil { limits = nil }; return }
+
+        func window(_ key: String) -> LimitWindow? {
+            guard let w = obj[key] as? [String: Any],
+                  let used = (w["used_percentage"] as? NSNumber)?.doubleValue,
+                  let resets = (w["resets_at"] as? NSNumber)?.doubleValue else { return nil }
+            return LimitWindow(usedPercent: used, resetsAt: Date(timeIntervalSince1970: resets))
+        }
+        let next = UsageLimits(fiveHour: window("five_hour"), sevenDay: window("seven_day"), updated: updated)
+        if next != limits { limits = next }
+    }
+
+    nonisolated static func terminalAccount() -> (uuid: String, email: String)? {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude.json")
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let acct = obj["oauthAccount"] as? [String: Any],
+              let uuid = acct["accountUuid"] as? String else { return nil }
+        return (uuid, acct["emailAddress"] as? String ?? "")
+    }
+
+    /// Points Claude Code's statusLine at our script (only when no other status line is set).
+    /// Keeps a backup of settings.json next to it.
+    func enableLimitsTracking() {
+        var settings = readClaudeSettings()
+        guard settings["statusLine"] == nil else { refreshLimits(); return }
+        if FileManager.default.fileExists(atPath: claudeSettingsURL.path) {
+            let backup = claudeSettingsURL.appendingPathExtension("bak-claudescheduler")
+            try? FileManager.default.removeItem(at: backup)
+            try? FileManager.default.copyItem(at: claudeSettingsURL, to: backup)
+        }
+        settings["statusLine"] = ["type": "command", "command": "\"\(statusLineURL.path)\""]
+        if let data = try? JSONSerialization.data(withJSONObject: settings,
+                                                  options: [.prettyPrinted, .withoutEscapingSlashes, .sortedKeys]) {
+            try? FileManager.default.createDirectory(at: claudeSettingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? data.write(to: claudeSettingsURL)
+        }
+        refreshLimits()
     }
 
     private func loadTasks() {
@@ -165,6 +252,7 @@ final class Store: ObservableObject {
 
     func refreshStatuses() {
         loadTasks()   // pick up tasks added outside the app
+        refreshLimits()
         var next: [String: TaskStatus] = [:]
         for task in tasks {
             if task.cancelled {

@@ -21,7 +21,7 @@ iconutil -c icns "$BUILD/icon.iconset" -o "$APP/Contents/Resources/AppIcon.icns"
 swiftc -O -parse-as-library -target arm64-apple-macos14 \
   Sources/Store.swift Sources/App.swift \
   -o "$APP/Contents/MacOS/ClaudeScheduler"
-cp Resources/run-task.sh Resources/icon-src/clock.svg "$APP/Contents/Resources/"
+cp Resources/run-task.sh Resources/statusline.sh Resources/icon-src/clock.svg "$APP/Contents/Resources/"
 cp Resources/Info.plist "$APP/Contents/"
 codesign --force --sign - "$APP" >/dev/null
 

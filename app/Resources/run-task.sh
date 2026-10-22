@@ -4,7 +4,7 @@
 #   <task-dir>/task.env   FOLDER, SESSION (empty = new session), FIRE_EPOCH, LABEL
 #   <task-dir>/prompt.txt the prompt
 #   <task-dir>/status     written here: "<state>|<message>|<epoch>"
-#   <task-dir>/pane.log   screen of the Claude session ~90s after sending
+#   <task-dir>/pane.log   screen of the Claude session when the run ended
 #   <task-dir>/run.log    timestamped steps of this run
 #   <task-dir>/target     tmux pane the prompt goes to
 
@@ -16,6 +16,58 @@ source "$TASK_DIR/task.env" || exit 1
 
 log() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S')  $*" >> "$TASK_DIR/run.log"; }
 set_status() { print -r -- "$1|$2|$(date +%s)" > "$TASK_DIR/status"; log "[$1] $2"; }
+
+# Keep-awake accounting: count only time the Mac was actually awake (a closed lid sleeps it
+# anyway; caffeinate -i only prevents idle sleep).
+AWAKE_SECS=0
+LAST_TICK=$(date +%s)
+tick() {
+  local now=$(date +%s) d
+  (( d = now - LAST_TICK ))
+  (( d > 90 )) && d=30          # a long gap means the Mac slept in between
+  (( AWAKE_SECS += d ))
+  LAST_TICK=$now
+}
+awake_text() {
+  tick
+  local mins=$(( (AWAKE_SECS + 30) / 60 ))
+  (( mins <= 1 )) && print -r -- "Claude kept your computer awake for 1 min." \
+                 || print -r -- "Claude kept your computer awake for $mins min."
+}
+
+# Claude is busy while a turn runs, and while background agents it started are running.
+pane() { tmux capture-pane -t "$TARGET" -p 2>/dev/null; }
+busy() { pane | grep -qE "esc to interrupt|Waiting for [0-9]+ background|↓ to manage"; }
+limited() { pane | grep -v '^[[:space:]]*$' | tail -12 | grep -qiE "usage limit reached|hit your session limit"; }
+
+# Ends the run: final status with the keep-awake time, plus a notification.
+end_run() {
+  local text="$2 $(awake_text)"
+  tmux capture-pane -t "$TARGET" -p -S -200 > "$TASK_DIR/pane.log" 2>/dev/null
+  set_status "$1" "$text"
+  osascript -e "display notification \"${text//\"/}\" with title \"Claude Scheduler\"" 2>/dev/null
+  finish
+}
+
+# Keeps the Mac awake and watches the session until Claude finishes or hits the limit.
+watch_claude() {
+  log "Keeping the Mac awake while Claude works"
+  local idle=0 shown=-1 mins
+  while true; do
+    sleep 30
+    tick
+    tmux has-session -t "$TMUX_SESSION" 2>/dev/null || end_run done "The Claude session was closed."
+    limited && end_run limit "Claude hit the usage limit."
+    if busy; then idle=0; else (( idle++ )); fi
+    (( idle >= 2 )) && end_run done "Claude finished."
+    (( AWAKE_SECS > 12 * 3600 )) && end_run done "Stopped watching after 12 hours."
+    mins=$(( AWAKE_SECS / 60 ))
+    if (( mins != shown )); then
+      print -r -- "working|Claude is working · keeping your Mac awake ($mins min)|$(date +%s)" > "$TASK_DIR/status"
+      shown=$mins
+    fi
+  done
+}
 
 finish() {
   log "Done; removing the launchd job"
@@ -31,6 +83,8 @@ command -v tmux >/dev/null || { set_status failed "tmux is not installed (brew i
 command -v claude >/dev/null || { set_status failed "claude CLI not found"; finish; }
 
 log "Fired. Folder: $FOLDER, session: ${SESSION:-new}"
+caffeinate -i -w $$ &           # no idle sleep until this script exits
+LAST_TICK=$(date +%s)
 set_status running "Starting"
 
 # 1. Find a tmux pane already running this session, or start one.
@@ -43,7 +97,7 @@ fi
 if [[ -n "$TARGET" ]]; then
   log "Found tmux pane already running this session: $TARGET"
 else
-  NAME="cs-${TASK_ID:0:8}"
+  NAME="cs-$TASK_ID"
   if [[ -n "$SESSION" ]]; then
     CMD="claude --resume $SESSION --permission-mode auto"
   else
@@ -79,17 +133,18 @@ fi
 #    limit), don't send a duplicate.
 FIRST_LINE=$(head -1 "$TASK_DIR/prompt.txt" | cut -c1-60)
 PANE=$(tmux capture-pane -t "$TARGET" -p -S -300 2>/dev/null)
-if print -r -- "$PANE" | grep -q "esc to interrupt" && print -r -- "$PANE" | grep -qF -- "$FIRST_LINE"; then
+if busy && print -r -- "$PANE" | grep -qF -- "$FIRST_LINE"; then
   set_status working "Claude is already working on this prompt (session $TARGET)"
-  finish
+  watch_claude
 fi
 
 # 3. Don't interrupt other work in progress: wait up to 30 min while Claude is busy.
 for i in {1..61}; do
-  tmux capture-pane -t "$TARGET" -p 2>/dev/null | grep -q "esc to interrupt" || break
-  if (( i == 61 )); then set_status failed "Not sent: Claude was still busy after 30 min"; finish; fi
+  busy || break
+  if (( i == 61 )); then end_run failed "Not sent: Claude was still busy after 30 min."; fi
   (( i == 1 )) && set_status running "Waiting for Claude to finish current work"
   sleep 30
+  tick
 done
 
 # 4. Paste the prompt (bracketed, so newlines don't submit early) and press Enter.
@@ -100,17 +155,5 @@ tmux load-buffer -b cs-prompt "$TASK_DIR/prompt.txt" \
 
 set_status sent "Sent to tmux session $TARGET at $(date +%H:%M)"
 
-# 5. Record what Claude shows shortly after, so the app can tell if it actually started.
-log "Waiting 90s to see how Claude reacts"
-sleep 90
-PANE=$(tmux capture-pane -t "$TARGET" -p -S -200 2>/dev/null)
-print -r -- "$PANE" > "$TASK_DIR/pane.log"
-if print -r -- "$PANE" | tail -15 | grep -qi "usage limit\|hit your session limit"; then
-  set_status limit "Sent, but Claude hit the usage limit"
-elif print -r -- "$PANE" | grep -q "esc to interrupt"; then
-  set_status working "Claude is working (session $TARGET)"
-else
-  log "Claude is idle after the prompt (it may have finished already)"
-fi
-
-finish
+# 5. Keep the Mac awake until Claude finishes or hits the usage limit.
+watch_claude
