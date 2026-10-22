@@ -54,7 +54,7 @@ struct LogsView: View {
                 Spacer()
                 if let task, let target = store.tmuxTarget(for: task) {
                     Button { store.openTerminal(attachedTo: target) } label: {
-                        Label("Watch live in Terminal", systemImage: "terminal")
+                        Label("Terminal", systemImage: "terminal")
                     }
                     .help("Opens Terminal attached to tmux session \(target)")
                 }
