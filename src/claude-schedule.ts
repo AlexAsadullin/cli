@@ -34,6 +34,7 @@ interface PromptResult {
 }
 
 interface ScheduleOptions {
+  startAtTime?: string; // wait until this time before executing ("3pm", "15:00", etc.)
   stopAtTime?: string; // "3pm", "15:00", etc.
   stopAfterHours?: number; // number of hours to run
   promptFile?: string; // custom prompt file path
@@ -50,11 +51,13 @@ function tmuxSendKeys(session: string, keys: string): void {
 }
 
 function tmuxLoadBufferFromData(data: string): void {
-  execSync(`echo "${data}" | tmux load-buffer -`);
+  // Pass via stdin so quotes/$/backticks in the prompt are not shell-interpreted
+  execSync('tmux load-buffer -', { input: data });
 }
 
 function tmuxPasteBuffer(session: string): void {
-  execSync(`tmux paste-buffer -t "${session}"`);
+  // -p: bracketed paste, so newlines in multi-line prompts don't submit early
+  execSync(`tmux paste-buffer -p -t "${session}"`);
 }
 
 function tmuxCapturePane(session: string): string {
@@ -79,6 +82,7 @@ function showHelp(): void {
   console.log(colors.info('  [1-n]') + colors.muted('   - Execute specific prompt by index'));
   
   console.log(colors.primary('\n⏰ TIME OPTIONS:'));
+  console.log(colors.info('  --start-at') + colors.muted('  - Wait until specific time before executing (e.g., --start-at 3am)'));
   console.log(colors.info('  --stop-at') + colors.muted('   - Stop execution at specific time (e.g., --stop-at 3pm)'));
   console.log(colors.info('  --hours') + colors.muted('     - Run for specified hours (e.g., --hours 2)'));
   
@@ -238,7 +242,10 @@ function parseArgs(): { command: string; options: ScheduleOptions } {
   const options: ScheduleOptions = {};
   
   for (let i = 1; i < args.length; i++) {
-    if (args[i] === '--stop-at' && args[i + 1]) {
+    if (args[i] === '--start-at' && args[i + 1]) {
+      options.startAtTime = args[i + 1];
+      i++; // Skip next arg
+    } else if (args[i] === '--stop-at' && args[i + 1]) {
       options.stopAtTime = args[i + 1];
       i++; // Skip next arg
     } else if (args[i] === '--hours' && args[i + 1]) {
@@ -433,7 +440,17 @@ async function main(): Promise<void> {
     console.log(colors.info(`📄 Current prompt file: ${promptFile}\n`));
     return;
   }
-  
+
+  if (options.startAtTime && command !== 'status' && command !== 'reset') {
+    const startAt = parseStopTime(options.startAtTime);
+    if (!startAt) {
+      console.log(colors.error(`❌ Invalid --start-at time: ${options.startAtTime}`));
+      process.exit(1);
+    }
+    console.log(colors.info(`⏰ Waiting until ${colors.accent(startAt.format('YYYY-MM-DD HH:mm:ss'))} to start...`));
+    await sleep(startAt.diff(dayjs()));
+  }
+
   if (command === 'run') {
     const startTime = dayjs();
     console.log(colors.highlight('\n🚀 Starting automated prompt execution...\n'));
