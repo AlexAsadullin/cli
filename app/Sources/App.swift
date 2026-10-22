@@ -16,6 +16,108 @@ struct ClaudeSchedulerApp: App {
         .defaultSize(width: 585, height: 400)   // the size of a default Terminal window
         .windowStyle(.hiddenTitleBar)
         .windowResizability(.contentMinSize)
+
+        WindowGroup("Logs", id: "logs", for: String.self) { $taskId in
+            if let taskId {
+                LogsView(taskId: taskId).environmentObject(store)
+            }
+        }
+        .defaultSize(width: 760, height: 520)
+    }
+}
+
+struct LogsView: View {
+    @EnvironmentObject var store: Store
+    let taskId: String
+    @State private var tab = "conversation"
+    @State private var text = ""
+    @State private var live = false
+    @State private var lastModified: Date?
+    private let timer = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
+    private var task: ScheduledTask? { store.tasks.first { $0.id == taskId } }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Picker("", selection: $tab) {
+                    Text("Conversation").tag("conversation")
+                    Text("Claude screen").tag("screen")
+                    Text("Run log").tag("run")
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 320)
+                if tab == "screen" {
+                    Text(live ? "● live" : "snapshot")
+                        .font(.system(size: 11))
+                        .foregroundStyle(live ? .green : .secondary)
+                }
+                Spacer()
+                if let task, let target = store.tmuxTarget(for: task) {
+                    Button("Open in Terminal") { attachInTerminal(target) }
+                        .help("tmux attach -t \(target)")
+                }
+                if let task {
+                    Button { NSWorkspace.shared.open(store.taskFolder(for: task)) } label: {
+                        Image(systemName: "folder")
+                    }
+                    .help("Show task files")
+                }
+            }
+            .padding(10)
+            Divider()
+            ScrollViewReader { proxy in
+                ScrollView([.vertical, .horizontal]) {
+                    Text(text)
+                        .font(.system(size: 11, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                    Color.clear.frame(height: 1).id("bottom")
+                }
+                .onChange(of: text) { _, _ in proxy.scrollTo("bottom", anchor: .bottom) }
+                .onAppear { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+        }
+        .navigationTitle(task.map { "Logs — " + $0.prompt.replacingOccurrences(of: "\n", with: " ").prefix(50) } ?? "Logs")
+        .onAppear(perform: reload)
+        .onChange(of: tab) { _, _ in text = ""; lastModified = nil; reload() }
+        .onReceive(timer) { _ in reload() }
+    }
+
+    private func reload() {
+        guard let task else { text = "This task was removed."; return }
+        if tab == "conversation" {
+            guard let url = store.transcriptURL(for: task) else {
+                text = "No transcript yet. It appears once the task has started a Claude session."
+                return
+            }
+            // Parsing a multi-MB transcript every 2s is wasteful: only re-read when the file changed.
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            guard modified != lastModified || text.isEmpty else { return }
+            lastModified = modified
+            Task.detached {
+                let conversation = Store.conversation(from: url)
+                await MainActor.run { if tab == "conversation" { text = conversation } }
+            }
+        } else if tab == "screen" {
+            let screen = store.claudeScreen(for: task)
+            // Drop the trailing blank lines of the tmux pane.
+            let trimmed = screen.text.replacingOccurrences(of: "\\s+$", with: "", options: .regularExpression)
+            if trimmed != text { text = trimmed }
+            live = screen.live
+        } else {
+            let log = store.runLog(for: task)
+            if log != text { text = log }
+        }
+    }
+
+    private func attachInTerminal(_ target: String) {
+        let session = target.split(separator: ":").first.map(String.init) ?? target
+        let script = "tell application \"Terminal\" to do script \"/opt/homebrew/bin/tmux attach -t \(session)\"\n"
+            + "tell application \"Terminal\" to activate"
+        NSAppleScript(source: script)?.executeAndReturnError(nil)
     }
 }
 
@@ -233,6 +335,7 @@ struct TaskRow: View {
     @EnvironmentObject var store: Store
     let task: ScheduledTask
     let status: TaskStatus?
+    @Environment(\.openWindow) private var openWindow
     @State private var hovering = false
 
     private var state: String { status?.state ?? "scheduled" }
@@ -294,12 +397,12 @@ struct TaskRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
         .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(hovering ? 0.05 : 0)))
+        .contentShape(Rectangle())
         .onHover { hovering = $0 }
-        .help(status?.message.isEmpty == false ? status!.message : task.prompt)
+        .onTapGesture { openWindow(id: "logs", value: task.id) }
+        .help(status?.message.isEmpty == false ? status!.message : "Click to open logs")
         .contextMenu {
-            if let log = store.paneLog(for: task) {
-                Button("Show Claude screen after sending") { NSWorkspace.shared.open(log) }
-            }
+            Button("Open Logs") { openWindow(id: "logs", value: task.id) }
             Button("Copy prompt") {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(task.prompt, forType: .string)

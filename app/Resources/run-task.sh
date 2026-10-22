@@ -5,6 +5,8 @@
 #   <task-dir>/prompt.txt the prompt
 #   <task-dir>/status     written here: "<state>|<message>|<epoch>"
 #   <task-dir>/pane.log   screen of the Claude session ~90s after sending
+#   <task-dir>/run.log    timestamped steps of this run
+#   <task-dir>/target     tmux pane the prompt goes to
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.claude/local:/usr/bin:/bin:/usr/sbin:/sbin"
 export LANG="${LANG:-en_US.UTF-8}"
@@ -12,9 +14,11 @@ export LANG="${LANG:-en_US.UTF-8}"
 TASK_DIR="$1"
 source "$TASK_DIR/task.env" || exit 1
 
-set_status() { print -r -- "$1|$2|$(date +%s)" > "$TASK_DIR/status"; }
+log() { print -r -- "$(date '+%Y-%m-%d %H:%M:%S')  $*" >> "$TASK_DIR/run.log"; }
+set_status() { print -r -- "$1|$2|$(date +%s)" > "$TASK_DIR/status"; log "[$1] $2"; }
 
 finish() {
+  log "Done; removing the launchd job"
   rm -f "$HOME/Library/LaunchAgents/$LABEL.plist"
   launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
   exit 0
@@ -26,6 +30,7 @@ if (( $(date +%s) < FIRE_EPOCH - 90 )); then exit 0; fi
 command -v tmux >/dev/null || { set_status failed "tmux is not installed (brew install tmux)"; finish; }
 command -v claude >/dev/null || { set_status failed "claude CLI not found"; finish; }
 
+log "Fired. Folder: $FOLDER, session: ${SESSION:-new}"
 set_status running "Starting"
 
 # 1. Find a tmux pane already running this session, or start one.
@@ -35,7 +40,9 @@ if [[ -n "$SESSION" ]]; then
            | grep -F -- "$SESSION" | head -1 | cut -d' ' -f1)
 fi
 
-if [[ -z "$TARGET" ]]; then
+if [[ -n "$TARGET" ]]; then
+  log "Found tmux pane already running this session: $TARGET"
+else
   NAME="cs-${TASK_ID:0:8}"
   if [[ -n "$SESSION" ]]; then
     CMD="claude --resume $SESSION --permission-mode auto"
@@ -45,13 +52,16 @@ if [[ -z "$TARGET" ]]; then
   tmux new-session -d -s "$NAME" -x 200 -y 50 -c "$FOLDER" "$CMD" \
     || { set_status failed "Could not start tmux session"; finish; }
   TARGET="$NAME"
+  log "Started tmux session $NAME: $CMD"
   # Wait for Claude's input box to appear.
   for i in {1..45}; do
     sleep 2
     tmux capture-pane -t "$TARGET" -p 2>/dev/null | grep -q "❯" && break
   done
   sleep 3
+  log "Claude is up"
 fi
+print -r -- "$TARGET" > "$TASK_DIR/target"
 
 # 2. If Claude is already busy with this very prompt (e.g. it auto-resumed after a usage
 #    limit), don't send a duplicate.
@@ -66,7 +76,7 @@ fi
 for i in {1..61}; do
   tmux capture-pane -t "$TARGET" -p 2>/dev/null | grep -q "esc to interrupt" || break
   if (( i == 61 )); then set_status failed "Not sent: Claude was still busy after 30 min"; finish; fi
-  set_status running "Waiting for Claude to finish current work"
+  (( i == 1 )) && set_status running "Waiting for Claude to finish current work"
   sleep 30
 done
 
@@ -79,6 +89,7 @@ tmux load-buffer -b cs-prompt "$TASK_DIR/prompt.txt" \
 set_status sent "Sent to tmux session $TARGET at $(date +%H:%M)"
 
 # 5. Record what Claude shows shortly after, so the app can tell if it actually started.
+log "Waiting 90s to see how Claude reacts"
 sleep 90
 PANE=$(tmux capture-pane -t "$TARGET" -p -S -200 2>/dev/null)
 print -r -- "$PANE" > "$TASK_DIR/pane.log"
@@ -86,6 +97,8 @@ if print -r -- "$PANE" | tail -15 | grep -qi "usage limit\|hit your session limi
   set_status limit "Sent, but Claude hit the usage limit"
 elif print -r -- "$PANE" | grep -q "esc to interrupt"; then
   set_status working "Claude is working (session $TARGET)"
+else
+  log "Claude is idle after the prompt (it may have finished already)"
 fi
 
 finish

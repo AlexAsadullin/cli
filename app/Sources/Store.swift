@@ -185,9 +185,125 @@ final class Store: ObservableObject {
         }
     }
 
-    func paneLog(for task: ScheduledTask) -> URL? {
-        let url = taskDir(task.id).appendingPathComponent("pane.log")
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+    func taskFolder(for task: ScheduledTask) -> URL { taskDir(task.id) }
+
+    /// Steps the runner logged, or a summary for tasks that ran before run.log existed.
+    func runLog(for task: ScheduledTask) -> String {
+        let dir = taskDir(task.id)
+        if let log = try? String(contentsOf: dir.appendingPathComponent("run.log"), encoding: .utf8) {
+            return log
+        }
+        let status = statuses[task.id]
+        return status?.state == "scheduled" || status == nil
+            ? "Not run yet. Fires \(task.fireDate.formatted(date: .abbreviated, time: .shortened))."
+            : "Last status: [\(status!.state)] \(status!.message)"
+    }
+
+    /// The tmux pane the task sends to: recorded by the runner, or found by session id.
+    func tmuxTarget(for task: ScheduledTask) -> String? {
+        if let t = try? String(contentsOf: taskDir(task.id).appendingPathComponent("target"), encoding: .utf8) {
+            return t.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !task.sessionId.isEmpty,
+              let panes = Self.tmux(["list-panes", "-a", "-F", "#{session_name}:#{window_index}.#{pane_index} #{pane_start_command}"])
+        else { return nil }
+        return panes.split(separator: "\n").first { $0.contains(task.sessionId) }
+            .map { String($0.split(separator: " ")[0]) }
+    }
+
+    /// Live screen (with scrollback) of the task's Claude session, else the snapshot taken after sending.
+    func claudeScreen(for task: ScheduledTask) -> (text: String, live: Bool) {
+        if let target = tmuxTarget(for: task),
+           let screen = Self.tmux(["capture-pane", "-p", "-J", "-S", "-2000", "-t", target]) {
+            return (screen, true)
+        }
+        if let snap = try? String(contentsOf: taskDir(task.id).appendingPathComponent("pane.log"), encoding: .utf8) {
+            return (snap, false)
+        }
+        return ("No Claude session to show yet.", false)
+    }
+
+    /// The session's transcript file. For a new session: the first one started in the folder after the task fired.
+    func transcriptURL(for task: ScheduledTask) -> URL? {
+        let projects = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        if !task.sessionId.isEmpty {
+            let dirs = (try? FileManager.default.contentsOfDirectory(at: projects, includingPropertiesForKeys: nil)) ?? []
+            return dirs.map { $0.appendingPathComponent("\(task.sessionId).jsonl") }
+                .first { FileManager.default.fileExists(atPath: $0.path) }
+        }
+        let encoded = task.folder.map { $0.isLetter || $0.isNumber ? String($0) : "-" }.joined()
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: projects.appendingPathComponent(encoded), includingPropertiesForKeys: [.creationDateKey])) ?? []
+        return files.filter { $0.pathExtension == "jsonl" }
+            .compactMap { url -> (URL, Date)? in
+                guard let c = (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate,
+                      c >= task.fireDate.addingTimeInterval(-60) else { return nil }
+                return (url, c)
+            }
+            .min { $0.1 < $1.1 }?.0
+    }
+
+    /// Readable conversation from the session transcript: messages, replies and tool calls.
+    nonisolated static func conversation(from url: URL, maxEntries: Int = 400) -> String {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return "Transcript not found." }
+        let timeIn = ISO8601DateFormatter()
+        timeIn.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let timeOut = DateFormatter()
+        timeOut.dateFormat = "MMM d HH:mm"
+        var out: [String] = []
+
+        for line in text.split(separator: "\n") {
+            guard line.contains("\"type\":\"user\"") || line.contains("\"type\":\"assistant\""),
+                  let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                  let msg = obj["message"] as? [String: Any] else { continue }
+            let time = (obj["timestamp"] as? String).flatMap { timeIn.date(from: $0) }.map { timeOut.string(from: $0) } ?? ""
+            let isUser = obj["type"] as? String == "user"
+
+            var blocks: [[String: Any]] = []
+            if let s = msg["content"] as? String { blocks = [["type": "text", "text": s]] }
+            else if let arr = msg["content"] as? [[String: Any]] { blocks = arr }
+
+            for b in blocks {
+                switch b["type"] as? String {
+                case "text":
+                    guard var t = b["text"] as? String else { continue }
+                    t = t.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if t.isEmpty || t.hasPrefix("<local-command") || t.hasPrefix("<command-") { continue }
+                    if isUser, t.hasPrefix("<task-notification>") {
+                        let summary = t.components(separatedBy: "<summary>").dropFirst().first?
+                            .components(separatedBy: "</summary>").first ?? "Background task update"
+                        out.append("\(time)  ⚑ \(summary)")
+                    } else {
+                        let who = isUser ? "▶ YOU" : "◆ CLAUDE"
+                        out.append("\n\(time)  \(who)\n" + t.split(separator: "\n").map { "    " + $0 }.joined(separator: "\n"))
+                    }
+                case "tool_use":
+                    let input = b["input"] as? [String: Any] ?? [:]
+                    let what = (input["description"] ?? input["file_path"] ?? input["command"] ?? input["pattern"] ?? "") as? String ?? ""
+                    let name = b["name"] as? String ?? "tool"
+                    out.append("\(time)      → \(name == "Agent" ? "Agent started" : name): \(what.prefix(140))")
+                default:
+                    continue
+                }
+            }
+        }
+        if out.isEmpty { return "No messages yet." }
+        return out.suffix(maxEntries).joined(separator: "\n")
+    }
+
+    nonisolated static func tmux(_ args: [String]) -> String? {
+        guard let path = ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux"]
+            .first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return p.terminationStatus == 0 ? String(decoding: data, as: UTF8.self) : nil
     }
 
     func add(folder: String, session: SessionInfo?, prompt: String, at date: Date) throws {
